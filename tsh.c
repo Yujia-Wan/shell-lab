@@ -250,8 +250,31 @@ int builtin_command(struct cmdline_tokens token) {
     }
 
     if (token.builtin == BUILTIN_JOBS) {
+        int output_fd = STDOUT_FILENO;
+        if (token.outfile != NULL) {
+            output_fd =
+                open(token.outfile, O_CREAT | O_TRUNC | O_WRONLY,
+                     S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+            if (output_fd == -1) {
+                if (errno == ENOENT) {
+                    sio_printf("%s : No such file or directory\n",
+                               token.outfile);
+                }
+                if (errno == EACCES) {
+                    sio_printf("%s: Permission denied\n", token.outfile);
+                }
+                return 1;
+            }
+        }
+
         sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
-        list_jobs(STDOUT_FILENO);
+        list_jobs(output_fd);
+        if (output_fd != STDOUT_FILENO) {
+            if (close(output_fd) < 0) {
+                perror("close error");
+                exit(1);
+            }
+        }
         sigprocmask(SIG_SETMASK, &prev_one, NULL);
         return 1;
     }
@@ -303,8 +326,54 @@ void eval(const char *cmdline) {
         if ((pid = fork()) == 0) { // Child runs user job
             sigprocmask(SIG_SETMASK, &prev_one, NULL);
             setpgid(0, 0);
+
+            if (token.infile != NULL) {
+                int input_fd = open(token.infile, O_RDONLY);
+                if (input_fd == -1) {
+                    if (errno == ENOENT) {
+                        sio_printf("%s : No such file or directory\n",
+                                   token.infile);
+                    }
+                    if (errno == EACCES) {
+                        sio_printf("%s: Permission denied\n", token.infile);
+                    }
+                    exit(1);
+                }
+                dup2(input_fd, STDIN_FILENO);
+                if (close(input_fd) < 0) {
+                    perror("close erroe");
+                    exit(1);
+                }
+            }
+
+            if (token.outfile != NULL) {
+                int output_fd = open(
+                    token.outfile, O_CREAT | O_TRUNC | O_WRONLY,
+                    S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH);
+                if (output_fd == -1) {
+                    if (errno == ENOENT) {
+                        sio_printf("%s : No such file or directory\n",
+                                   token.outfile);
+                    }
+                    if (errno == EACCES) {
+                        sio_printf("%s: Permission denied\n", token.outfile);
+                    }
+                    exit(1);
+                }
+                dup2(output_fd, STDOUT_FILENO);
+                if (close(output_fd) < 0) {
+                    perror("close erroe");
+                    exit(1);
+                }
+            }
+
             if (execve(token.argv[0], token.argv, environ) < 0) {
-                perror("execve error");
+                if (errno == ENOENT) {
+                    sio_printf("%s: No such file or directory\n", cmdline);
+                }
+                if (errno == EACCES) {
+                    sio_printf("%s: Permission denied\n", cmdline);
+                }
                 exit(1);
             }
         }
