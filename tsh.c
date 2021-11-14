@@ -8,8 +8,7 @@
  *  Follow the 15-213/18-213/15-513 style guide at
  *  http://www.cs.cmu.edu/~213/codeStyle.html.>
  *
- * @author Your Name <andrewid@andrew.cmu.edu>
- * TODO: Include your name and Andrew ID here.
+ * @author Yujia Wang <yujiawan@andrew.cmu.edu>
  */
 
 #include "csapp.h"
@@ -46,7 +45,6 @@
 
 /* Function prototypes */
 void eval(const char *cmdline);
-
 void sigchld_handler(int sig);
 void sigtstp_handler(int sig);
 void sigint_handler(int sig);
@@ -160,6 +158,111 @@ int main(int argc, char **argv) {
     return -1; // control never reaches here
 }
 
+void bgfg(struct cmdline_tokens token) {
+    if (token.argc != 2) {
+        sio_printf("%s command requires PID or %%jobid argument\n",
+                   token.argv[0]);
+        return;
+    }
+
+    pid_t pid;
+    jid_t jid;
+
+    sigset_t mask_all, prev_one;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+
+    if (token.argv[1][0] == '%') {
+        // jid
+        jid = atoi(&token.argv[1][1]);
+        if (jid == 0) {
+            sio_printf("%s: argument must be a PID or %%jobid\n",
+                       token.argv[0]);
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+        if (!job_exists(jid)) {
+            sio_printf("%%%d: No such job\n", (int)jid);
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+        pid = job_get_pid(jid);
+    } else {
+        // pid
+        pid = atoi(&token.argv[1][0]);
+        if (pid == 0) {
+            sio_printf("%s: argument must be a PID or %%jobid\n",
+                       token.argv[0]);
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+        jid = job_from_pid(pid);
+        if (jid == 0) {
+            sio_printf("%d: No such job\n", (int)pid);
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+    }
+
+    job_state state = job_get_state(jid);
+    if (token.builtin == BUILTIN_BG) {
+        // bg job
+        if (state == FG || state == UNDEF) {
+            sio_printf("bg job error\n");
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+        if (state == ST) {
+            job_set_state(jid, BG);
+            kill(-pid, SIGCONT);
+            sio_printf("[%d] (%d) %s\n", (int)jid, (int)pid,
+                       job_get_cmdline(jid));
+        }
+    } else {
+        // fg job
+        if (state == UNDEF) {
+            sio_printf("fg job error\n");
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            return;
+        }
+        if (state == BG || state == ST) {
+            if (fg_job() != 0) {
+                sio_printf("a foreground job already exists.\n");
+                sigprocmask(SIG_SETMASK, &prev_one, NULL);
+                return;
+            }
+            job_set_state(jid, FG);
+            kill(-pid, SIGCONT);
+            while (fg_job() != 0) {
+                sigsuspend(&prev_one);
+            }
+        }
+    }
+    sigprocmask(SIG_SETMASK, &prev_one, NULL);
+}
+
+int builtin_command(struct cmdline_tokens token) {
+    sigset_t mask_all, prev_one;
+    sigfillset(&mask_all);
+
+    if (token.builtin == BUILTIN_QUIT) {
+        exit(0);
+    }
+
+    if (token.builtin == BUILTIN_JOBS) {
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+        list_jobs(STDOUT_FILENO);
+        sigprocmask(SIG_SETMASK, &prev_one, NULL);
+        return 1;
+    }
+
+    if (token.builtin == BUILTIN_BG || token.builtin == BUILTIN_FG) {
+        bgfg(token);
+        return 1;
+    }
+    return 0;
+}
+
 /**
  * @brief <What does eval do?>
  *
@@ -173,6 +276,10 @@ void eval(const char *cmdline) {
     parseline_return parse_result;
     struct cmdline_tokens token;
 
+    pid_t pid;
+    jid_t jid;
+    job_state state;
+
     // Parse command line
     parse_result = parseline(cmdline, &token);
 
@@ -180,7 +287,40 @@ void eval(const char *cmdline) {
         return;
     }
 
+    if (parse_result == PARSELINE_BG) {
+        state = BG;
+    }
+
+    if (parse_result == PARSELINE_FG) {
+        state = FG;
+    }
+
     // TODO: Implement commands here.
+    sigset_t mask_all, prev_one;
+    sigfillset(&mask_all);
+    if (!builtin_command(token)) {
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+        if ((pid = fork()) == 0) { // Child runs user job
+            sigprocmask(SIG_SETMASK, &prev_one, NULL);
+            setpgid(0, 0);
+            if (execve(token.argv[0], token.argv, environ) < 0) {
+                perror("execve error");
+                exit(1);
+            }
+        }
+
+        sigprocmask(SIG_BLOCK, &mask_all, NULL);
+        jid = add_job(pid, state, cmdline);
+
+        if (state != BG) {
+            while (fg_job()) {
+                sigsuspend(&prev_one);
+            }
+        } else {
+            sio_printf("[%d] (%d) %s\n", (int)jid, (int)pid, cmdline);
+        }
+        sigprocmask(SIG_SETMASK, &prev_one, NULL);
+    }
 }
 
 /*****************
@@ -192,21 +332,76 @@ void eval(const char *cmdline) {
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigchld_handler(int sig) {}
+void sigchld_handler(int sig) {
+    int olderrno = errno;
+    sigset_t mask_all, prev_one;
+    pid_t pid;
+    jid_t jid;
+    int status;
+
+    sigfillset(&mask_all);
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+        sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+        if (WIFEXITED(status)) {
+            jid = job_from_pid(pid);
+            delete_job(jid);
+        }
+
+        if (WIFSIGNALED(status)) {
+            jid = job_from_pid(pid);
+            delete_job(jid);
+            sio_printf("Job [%d] (%d) terminated by signal %d\n", (int)jid,
+                       (int)pid, WTERMSIG(status));
+        }
+
+        if (WIFSTOPPED(status)) {
+            jid = job_from_pid(pid);
+            job_set_state(jid, ST);
+            sio_printf("Job [%d] (%d) stopped by signal %d\n", (int)jid,
+                       (int)pid, WSTOPSIG(status));
+        }
+        sigprocmask(SIG_SETMASK, &prev_one, NULL);
+    }
+    errno = olderrno;
+}
 
 /**
  * @brief <What does sigint_handler do?>
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigint_handler(int sig) {}
+void sigint_handler(int sig) {
+    int olderrno = errno;
+    sigset_t mask_all, prev_one;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+    jid_t jid = fg_job();
+    if (jid) {
+        pid_t pid = job_get_pid(jid);
+        kill(-pid, SIGINT);
+    }
+    sigprocmask(SIG_SETMASK, &prev_one, NULL);
+    errno = olderrno;
+}
 
 /**
  * @brief <What does sigtstp_handler do?>
  *
  * TODO: Delete this comment and replace it with your own.
  */
-void sigtstp_handler(int sig) {}
+void sigtstp_handler(int sig) {
+    int olderrno = errno;
+    sigset_t mask_all, prev_one;
+    sigfillset(&mask_all);
+    sigprocmask(SIG_BLOCK, &mask_all, &prev_one);
+    jid_t jid = fg_job();
+    if (jid) {
+        pid_t pid = job_get_pid(jid);
+        kill(-pid, SIGTSTP);
+    }
+    sigprocmask(SIG_SETMASK, &prev_one, NULL);
+    errno = olderrno;
+}
 
 /**
  * @brief Attempt to clean up global resources when the program exits.
